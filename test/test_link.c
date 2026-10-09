@@ -89,9 +89,9 @@ int main(void)
         link485_service();
         link485_service();
         CHECK(hdx_test_sends == sends + 2);
-        struct tmp_scanner scanner;
-        struct tmp_frame   reply;
-        uint8_t            sequences[2] = { 0u, 0u };
+        static struct tmp_scanner scanner;
+        static struct tmp_frame   reply;
+        uint8_t                   sequences[2] = { 0u, 0u };
         int                replies = 0;
         tmp_scanner_reset(&scanner);
         for (size_t index = 0u; index < hdx_test_wire_out_length; index++) {

@@ -54,11 +54,11 @@ import time
 import zlib
 
 # Set from the command line in main().
-UNIT_MAC = bytes.fromhex("025645444301")
-RECON_MAC = bytes.fromhex("02000a370001")   # any; the slave answers what it is sent
+SLAVE_MAC = bytes.fromhex("025645444301")
+MASTER_MAC = bytes.fromhex("02000a370001")   # any; the slave answers what it is sent
 JUNK_MAC = bytes.fromhex("02000a3700ff")    # nobody's
-UNIT_IP = bytes([10, 55, 0, 3])
-RECON_IP = bytes([10, 55, 0, 1])
+SLAVE_IP = bytes([10, 55, 0, 3])
+MASTER_IP = bytes([10, 55, 0, 1])
 SLAVE_ADDRESS = 0x01
 
 
@@ -115,9 +115,9 @@ def echo_request(ident, sequence, data):
     icmp = struct.pack(">BBHHH", 8, 0, 0, ident, sequence) + data
     icmp = icmp[:2] + struct.pack(">H", ip_checksum(icmp)) + icmp[4:]
     ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(icmp), sequence, 0x4000, 64, 1, 0,
-                     RECON_IP, UNIT_IP)
+                     MASTER_IP, SLAVE_IP)
     ip = ip[:10] + struct.pack(">H", ip_checksum(ip)) + ip[12:]
-    return UNIT_MAC + RECON_MAC + b"\x08\x00" + ip + icmp
+    return SLAVE_MAC + MASTER_MAC + b"\x08\x00" + ip + icmp
 
 
 def echo_reply_data(frame, ident, sequence):
@@ -133,11 +133,11 @@ def echo_reply_data(frame, ident, sequence):
 def arp_reply_to(frame):
     """Our answer when frame is an ARP request for the master, else None."""
     if len(frame) < 42 or frame[12:14] != b"\x08\x06" or frame[20:22] != b"\x00\x01" \
-            or frame[38:42] != RECON_IP:
+            or frame[38:42] != MASTER_IP:
         return None
     sender_mac, sender_ip = frame[22:28], frame[28:32]
-    arp = struct.pack(">HHBBH", 1, 0x0800, 6, 4, 2) + RECON_MAC + RECON_IP + sender_mac + sender_ip
-    return sender_mac + RECON_MAC + b"\x08\x06" + arp
+    arp = struct.pack(">HHBBH", 1, 0x0800, 6, 4, 2) + MASTER_MAC + MASTER_IP + sender_mac + sender_ip
+    return sender_mac + MASTER_MAC + b"\x08\x06" + arp
 
 
 class Master:
@@ -254,7 +254,7 @@ def run(arguments):
         master.reset()
         started, before = time.monotonic(), uart_counters(arguments.port)
         for _ in range(arguments.junk):
-            frame = master.take_pending() or (JUNK_MAC + RECON_MAC + b"\x88\xb5" + rng.randbytes(1500))
+            frame = master.take_pending() or (JUNK_MAC + MASTER_MAC + b"\x88\xb5" + rng.randbytes(1500))
             master.exchange(frame)
         report(f"junk 1514 B x{arguments.junk}", master, started, before,
                uart_counters(arguments.port))
@@ -311,10 +311,10 @@ def main():
     arguments = parser.parse_args()
     if not (arguments.listen or arguments.empty or arguments.junk or arguments.echo):
         arguments.listen, arguments.empty, arguments.junk, arguments.echo = 1.0, 2000, 200, 300
-    global UNIT_MAC, UNIT_IP, RECON_IP, SLAVE_ADDRESS
-    UNIT_MAC = bytes.fromhex(arguments.slave_mac.replace(":", ""))
-    UNIT_IP = socket.inet_aton(arguments.slave_ip)
-    RECON_IP = socket.inet_aton(arguments.master_ip)
+    global SLAVE_MAC, SLAVE_IP, MASTER_IP, SLAVE_ADDRESS
+    SLAVE_MAC = bytes.fromhex(arguments.slave_mac.replace(":", ""))
+    SLAVE_IP = socket.inet_aton(arguments.slave_ip)
+    MASTER_IP = socket.inet_aton(arguments.master_ip)
     SLAVE_ADDRESS = arguments.address
     largest = arguments.frame_max - 42
     if arguments.size is None:
