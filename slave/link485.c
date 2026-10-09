@@ -18,13 +18,19 @@ static struct outbound_slot outbound[OUTBOUND_SLOTS];
 static uint8_t outbound_head;
 static uint8_t outbound_count;
 
+/* The last reply, for a poll that asks for it again (TMP_FLAG_RETRY): its
+ * SEQ, and whether it carried the head of the queue, which then stays there
+ * until a new poll shows the reply arrived. */
+static bool    replied;
+static uint8_t replied_sequence;
+static bool    head_sent;
+
 static void (*before_reply)(void);
-static void (*on_idle_poll)(void);
 static void (*tap)(bool transmitted, const uint8_t *data, size_t length);
 static uint32_t last_poll_ms;
 static bool     polled;
 static uint32_t frames;
-static uint32_t idle_polls;
+static uint32_t retries;
 
 void link485_init(void)
 {
@@ -32,17 +38,14 @@ void link485_init(void)
     inbound_length = 0u;
     outbound_head = 0u;
     outbound_count = 0u;
+    replied = false;
+    head_sent = false;
     polled = false;
 }
 
 void link485_set_before_reply(void (*hook)(void))
 {
     before_reply = hook;
-}
-
-void link485_set_on_idle_poll(void (*hook)(void))
-{
-    on_idle_poll = hook;
 }
 
 void link485_set_tap(void (*function)(bool, const uint8_t *, size_t))
@@ -60,11 +63,24 @@ uint32_t link485_frames(void)
     return frames;
 }
 
-uint32_t link485_idle_polls(void)
+uint32_t link485_retries(void)
 {
-    return idle_polls;
+    return retries;
 }
 
+/* The head of the queue arrived: it leaves. */
+static void head_delivered(void)
+{
+    if (head_sent) {
+        outbound_head = (uint8_t)((outbound_head + 1u) % OUTBOUND_SLOTS);
+        outbound_count--;
+        frames++;
+        head_sent = false;
+    }
+}
+
+/* The answer to a poll: the head of the queue, or nothing. The head stays
+ * queued, so a poll that asks again gets the same frame. */
 static void reply(uint8_t sequence)
 {
     static uint8_t wire[1u + TMP_FRAME_OVERHEAD + LINK485_FRAME_MAX];
@@ -81,11 +97,9 @@ static void reply(uint8_t sequence)
     if (tap != NULL) {
         tap(true, wire, wire_length);
     }
-    if (outbound_count != 0u) {
-        outbound_head = (uint8_t)((outbound_head + 1u) % OUTBOUND_SLOTS);
-        outbound_count--;
-        frames++;
-    }
+    replied = true;
+    replied_sequence = sequence;
+    head_sent = length != 0u;
     /* Whatever the scanner held came before our reply: start the next frame clean.
      * Bytes of the next poll may already be in the ring; they are kept. */
     tmp_scanner_reset(&scanner);
@@ -125,14 +139,19 @@ void link485_service(void)
 
     polled = true;
     last_poll_ms = hdx_millis();
-    inbound_length = inbound.length;
-    if (inbound_length != 0u) {
-        frames++;
-    } else if (outbound_count == 0u) {
-        /* The master has nothing more for us, and everything we sent has gone. */
-        idle_polls++;
-        if (on_idle_poll != NULL) {
-            on_idle_poll();
+    if (tmp_is_retry(inbound.flags) && replied && inbound.sequence == replied_sequence) {
+        /* Our reply did not reach the master intact: the same again. The
+         * poll's frame is the one we took the first time; it is not taken
+         * twice (the stack may still be reading that copy). */
+        retries++;
+    } else {
+        /* A new exchange: the master has our last reply. A poll asking again
+         * for a reply we never sent (we did not hear the first, or we reset
+         * since) is new to us too. */
+        head_delivered();
+        inbound_length = inbound.length;
+        if (inbound_length != 0u) {
+            frames++;
         }
     }
     if (before_reply != NULL) {

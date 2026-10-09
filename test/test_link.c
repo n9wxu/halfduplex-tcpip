@@ -1,13 +1,13 @@
 /* The slave link and MAC driver, driven as the master would drive them, with
  * the real IP stack on top: ARP, ping, a UDP datagram and a TCP open all have
- * to make the round trip through TMP-v2 frames. */
+ * to make the round trip through TMP-v2 frames, and a damaged or missing
+ * reply is repaired by the link (TMP_FLAG_RETRY). */
 
 #include <string.h>
 #include "link485_config.h"
 #include "link485.h"
 #include "master.h"
 #include "tcp.h"
-#include "tcplink.h"
 #include "udp.h"
 
 static void echo(net_t *n, uint32_t source_ip, uint16_t source_port, const uint8_t *source_mac,
@@ -24,13 +24,6 @@ static tcp_saw_rx_ctx_t from_client;
 static uint8_t          to_client_bytes[512], from_client_bytes[128];
 
 static int tap_received, tap_transmitted;
-
-#define FAR_IP NET_IPV4(192, 168, 7, 9)   /* a host beyond the master, routed */
-
-static tcp_conn_t       far;
-static tcp_saw_tx_ctx_t far_out;
-static tcp_saw_rx_ctx_t far_in;
-static uint8_t          far_out_bytes[512], far_in_bytes[128];
 
 /* A TCP segment to the unit; returns the frame's length. */
 static size_t tcp_frame(uint8_t *frame, uint32_t source, uint16_t source_port,
@@ -62,10 +55,36 @@ static bool is_tcp_from(const struct tmp_frame *frame, uint16_t port, uint8_t fl
         && (frame->payload[34 + 13] & flags) == flags;
 }
 
-static int idle_polls_heard;
-static void count_idle_poll(void)
+/* A datagram from the unit to the master, through the link's queue. */
+static net_err_t datagram(const char *text)
 {
-    idle_polls_heard++;
+    return udp_send(&net, MASTER_IP, master_mac, TEST_UDP_PORT, 40000u, (const uint8_t *)text,
+                    (uint16_t)strlen(text));
+}
+
+/* The unit's answer is that datagram. */
+static bool is_datagram(const struct tmp_frame *frame, const char *text)
+{
+    const size_t length = strlen(text);
+    return frame->length == 42u + length && memcmp(frame->payload + 42, text, length) == 0;
+}
+
+/* A ping to the unit carrying `text` (4 bytes); returns the frame's length. */
+static size_t ping(uint8_t *frame, const char *text)
+{
+    const size_t length = ipv4(frame, 1u, 8u + 4u);
+    memset(frame + length, 0, 8);
+    frame[length] = 8u;
+    memcpy(frame + length + 8, text, 4);
+    put16(frame + length + 2, checksum(frame + length, 12u, 0u));
+    return length + 12u;
+}
+
+/* The unit's answer is the echo reply to that ping. */
+static bool is_echo_reply(const struct tmp_frame *frame, const char *text)
+{
+    return frame->length >= 46u && frame->payload[23] == 1u && frame->payload[34] == 0u
+        && memcmp(frame->payload + 42, text, 4) == 0;
 }
 
 static void tap(bool transmitted, const uint8_t *data, size_t length)
@@ -207,7 +226,10 @@ int main(void)
     CHECK(connection.state == TCP_SYN_RECEIVED);
 
     /* More frames than the queue holds: the surplus is dropped, the link
-     * carries the rest one per poll and then goes back to empty replies. */
+     * carries the rest one per poll and then goes back to empty replies. (The
+     * SYN+ACK's slot is free once a new poll has shown that it arrived.) */
+    poll(LINK485_ADDRESS, NULL, 0u);
+    CHECK(answered && answer.length == 0u);
     for (int count = 0; count < 10; count++) {
         (void)udp_send(&net, MASTER_IP, master_mac, TEST_UDP_PORT, 40000u,
                        (const uint8_t *)"x", 1u);
@@ -220,72 +242,133 @@ int main(void)
     }
     CHECK(carried == 6);
 
-    /* The idle-poll hook hears a poll with no frame for us while nothing of
-     * ours waits to go: not a poll that carries a frame, not while our
-     * answer to it waits. */
-    link485_set_on_idle_poll(count_idle_poll);
-    poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(idle_polls_heard == 1);
-    length = ipv4(frame, 1u, 8u + 4u);                     /* a ping: a frame */
-    memset(frame + length, 0, 8); frame[length] = 8u;
-    memcpy(frame + length + 8, "idle", 4);
-    put16(frame + length + 2, checksum(frame + length, 12u, 0u));
-    poll(LINK485_ADDRESS, frame, length + 12u);
-    CHECK(idle_polls_heard == 1);
-    poll(LINK485_ADDRESS, NULL, 0u);                       /* the echo reply waits */
-    CHECK(idle_polls_heard == 1 && answered && answer.length >= 46u);
-    poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(idle_polls_heard == 2);
+    /* Link retry. A reply the master did not get intact it asks for again:
+     * the same SEQ with TMP_FLAG_RETRY. The same frame comes back, as often
+     * as asked, and leaves the queue only when a new poll shows it arrived. */
+    {
+        static struct tmp_frame first;
+        const uint32_t frames_before = link485_frames(), retries_before = link485_retries();
+        CHECK(datagram("once") == NET_OK);
+        poll(LINK485_ADDRESS, NULL, 0u);
+        CHECK(answered && is_datagram(&answer, "once"));
+        first = answer;
+        for (int again = 0; again < 2; again++) {          /* damaged twice */
+            poll_again(LINK485_ADDRESS, NULL, 0u);
+            CHECK(answered && answer.sequence == first.sequence && answer.length == first.length);
+            CHECK(memcmp(answer.payload, first.payload, first.length) == 0);
+        }
+        CHECK(link485_retries() == retries_before + 2u);
+        poll(LINK485_ADDRESS, NULL, 0u);                    /* it arrived: gone */
+        CHECK(answered && answer.length == 0u);
+        CHECK(link485_frames() == frames_before + 1u);
+    }
 
-    /* TCP on the link: the poll is the clock (tcplink). The SYN+ACK above was
-     * never acknowledged: the next idle poll sends it again. */
-    tcplink_init(&net);
-    uint32_t retransmitted = tcplink_retransmissions();
+    /* So its slot stays taken until then: with the queue full, a reply
+     * makes no room, nor does a reply asked for again; the next new poll
+     * does. */
+    {
+        int queued = 0;
+        while (queued <= (int)LINK485_OUTBOUND_SLOTS && datagram("q") == NET_OK) {
+            queued++;
+        }
+        CHECK(queued == (int)LINK485_OUTBOUND_SLOTS);
+        poll(LINK485_ADDRESS, NULL, 0u);
+        CHECK(answered && is_datagram(&answer, "q"));
+        CHECK(datagram("q") == NET_ERR_BUSY);
+        poll_again(LINK485_ADDRESS, NULL, 0u);
+        CHECK(datagram("q") == NET_ERR_BUSY);
+        poll(LINK485_ADDRESS, NULL, 0u);                    /* the first arrived */
+        CHECK(answered && is_datagram(&answer, "q"));
+        CHECK(datagram("q") == NET_OK);
+        int carried = 2;
+        for (int count = 0; count < 10 && answered && answer.length != 0u; count++) {
+            poll(LINK485_ADDRESS, NULL, 0u);
+            carried += (answer.length != 0u);
+        }
+        CHECK(answered && answer.length == 0u && carried == (int)LINK485_OUTBOUND_SLOTS + 1);
+    }
+
+    /* The poll's own frame is taken once, however often it comes: a ping
+     * whose reply was damaged goes again, and one echo reply comes back. (The
+     * reply to the poll asked again may carry what was queued since.) */
+    poll(LINK485_ADDRESS, frame, ping(frame, "dup?"));
+    CHECK(answered && answer.length == 0u);
+    poll_again(LINK485_ADDRESS, frame, ping(frame, "dup?"));
+    CHECK(answered && is_echo_reply(&answer, "dup?"));
     poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(answered && is_tcp_from(&answer, TEST_TCP_PORT, TCP_FLAG_SYN | TCP_FLAG_ACK));
-    CHECK(get_be32(&answer.payload[34 + 4]) == unit_iss);
-    CHECK(tcplink_retransmissions() == ++retransmitted);
-    /* Acknowledged: established, and nothing goes again. */
+    CHECK(answered && answer.length == 0u);                 /* not a second echo */
+
+    /* A poll the slave did not hear (its CRC broken on the wire) gets no
+     * answer; the master sends it again with TMP_FLAG_RETRY, frame and all,
+     * and to the slave, which never answered that SEQ, it is new. */
+    {
+        uint8_t wire[128];
+        length = ping(frame, "lost");
+        sequence = (uint8_t)(sequence + 1u);
+        const size_t wire_length = tmp_frame_build(wire, TMP_POLL, LINK485_ADDRESS, sequence,
+                                                   tmp_flags(false, 0u), frame, length);
+        wire[wire_length - 1u] ^= 0xFFu;
+        exchange_raw(wire, wire_length);
+        CHECK(!answered);
+        poll_again(LINK485_ADDRESS, frame, length);
+        CHECK(answered && answer.sequence == sequence);
+        poll(LINK485_ADDRESS, NULL, 0u);
+        CHECK(answered && is_echo_reply(&answer, "lost"));
+    }
+
+    /* A slave that reset since has no reply to repeat: a poll asking again,
+     * even for the SEQ it answered last, is new to it, and its frame is
+     * taken. */
+    poll(LINK485_ADDRESS, NULL, 0u);
+    link485_init();
+    poll_again(LINK485_ADDRESS, frame, ping(frame, "rset"));
+    CHECK(answered && answer.length == 0u);
+    poll(LINK485_ADDRESS, NULL, 0u);
+    CHECK(answered && is_echo_reply(&answer, "rset"));
+    poll(LINK485_ADDRESS, NULL, 0u);
+
+    /* A poll asking again for another SEQ than our last reply's is a new
+     * exchange too: that reply arrived, and its frame leaves the queue. */
+    CHECK(datagram("seq") == NET_OK);
+    poll(LINK485_ADDRESS, NULL, 0u);
+    CHECK(answered && is_datagram(&answer, "seq"));
+    poll_as(LINK485_ADDRESS, (uint8_t)(sequence + 7u),
+            (uint8_t)(tmp_flags(false, 0u) | TMP_FLAG_RETRY), NULL, 0u);
+    CHECK(answered && answer.length == 0u);
+
+    /* tmptun's rule (tmp_retry()): a reply damaged every time is asked for
+     * TMP_RETRY_LIMIT times more, then given up, and the frame it carried is
+     * gone (TCP or the application retries). Damaged fewer times, it arrives. */
+    CHECK(datagram("gone") == NET_OK);
+    CHECK(exchange(LINK485_ADDRESS, NULL, 0u, TMP_RETRY_LIMIT + 1, TMP_RETRY_LIMIT)
+          == TMP_RETRY_LIMIT + 1);
+    CHECK(answered && is_datagram(&answer, "gone"));
+    CHECK(exchange(LINK485_ADDRESS, NULL, 0u, 0, TMP_RETRY_LIMIT) == 1);
+    CHECK(answered && answer.length == 0u);
+    CHECK(datagram("kept") == NET_OK);
+    CHECK(exchange(LINK485_ADDRESS, NULL, 0u, 2, TMP_RETRY_LIMIT) == 3);
+    CHECK(answered && is_datagram(&answer, "kept"));
+    CHECK(exchange(LINK485_ADDRESS, NULL, 0u, 0, TMP_RETRY_LIMIT) == 1);
+    CHECK(answered && answer.length == 0u);
+
+    /* TCP over it: a segment whose reply was damaged is repaired by the link,
+     * byte for byte, and TCP sends it once. The SYN+ACK above went out;
+     * acknowledged, the connection is established. */
     poll(LINK485_ADDRESS, frame,
          tcp_frame(frame, MASTER_IP, 40001u, TEST_TCP_PORT, 1001u, unit_iss + 1u, TCP_FLAG_ACK,
                    NULL));
     CHECK(connection.state == TCP_ESTABLISHED);
-    poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(answered && answer.length == 0u && tcplink_retransmissions() == retransmitted);
-    /* Data: it goes out, the master's host never gets it intact, so the next
-     * poll is idle and it goes again; acknowledged, it stops. */
     CHECK(tcp_send(&net, &connection, (const uint8_t *)"hello", 5u) == 5);
-    poll(LINK485_ADDRESS, NULL, 0u);
+    CHECK(exchange(LINK485_ADDRESS, NULL, 0u, 1, TMP_RETRY_LIMIT) == 2);
     CHECK(answered && is_tcp_from(&answer, TEST_TCP_PORT, TCP_FLAG_ACK));
     CHECK(answer.length == 54u + 5u && memcmp(answer.payload + 54, "hello", 5) == 0);
-    poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(answered && answer.length == 54u + 5u && memcmp(answer.payload + 54, "hello", 5) == 0);
     CHECK(get_be32(&answer.payload[34 + 4]) == unit_iss + 1u);
-    CHECK(tcplink_retransmissions() == ++retransmitted);
     poll(LINK485_ADDRESS, frame,
          tcp_frame(frame, MASTER_IP, 40001u, TEST_TCP_PORT, 1001u, unit_iss + 6u, TCP_FLAG_ACK,
                    NULL));
+    CHECK(answered && answer.length == 0u);
     poll(LINK485_ADDRESS, NULL, 0u);
-    CHECK(answered && answer.length == 0u && tcplink_retransmissions() == retransmitted);
-
-    /* A peer beyond the master answers when it answers: its connection keeps
-     * TCP's own timer, and an idle poll sends nothing again. */
-    {
-        static tcp_conn_t *both[2] = { &connection, &far };
-        tcp_saw_tx_init(&far_out, far_out_bytes, sizeof far_out_bytes);
-        tcp_saw_rx_init(&far_in, far_in_bytes, sizeof far_in_bytes);
-        CHECK(tcp_conn_init(&far, &tcp_saw_tx_ops, &far_out, &tcp_saw_rx_ops, &far_in, NULL)
-              == NET_OK);
-        CHECK(tcp_listen(&far, TEST_TCP_PORT + 1u) == NET_OK);
-        tcp_set_connections(&net, both, 2);
-        poll(LINK485_ADDRESS, frame,
-             tcp_frame(frame, FAR_IP, 40002u, TEST_TCP_PORT + 1u, 5000u, 0u, TCP_FLAG_SYN, NULL));
-        CHECK(far.state == TCP_SYN_RECEIVED);
-        poll(LINK485_ADDRESS, NULL, 0u);                   /* the SYN+ACK goes out */
-        CHECK(answered && answer.length != 0u);
-        poll(LINK485_ADDRESS, NULL, 0u);
-        CHECK(answered && answer.length == 0u && tcplink_retransmissions() == retransmitted);
-    }
+    CHECK(answered && answer.length == 0u);
 
     printf("link: ok\n");
     return 0;

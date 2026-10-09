@@ -35,8 +35,7 @@ include(cmake/deps.cmake)
 
 set(HDX_SLAVE_SOURCES
     ${PROJECT_SOURCE_DIR}/slave/link485.c
-    ${PROJECT_SOURCE_DIR}/slave/linkcheck.c
-    ${PROJECT_SOURCE_DIR}/slave/tcplink.c)
+    ${PROJECT_SOURCE_DIR}/slave/linkcheck.c)
 set(HDX_SLAVE_INCLUDES ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/slave)
 
 # The slave and one port in one archive, so the port's HAL resolves the

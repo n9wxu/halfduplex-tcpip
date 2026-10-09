@@ -4,11 +4,13 @@ include(FetchContent)
 # packages' build files are not used (SOURCE_SUBDIR names a directory that does
 # not exist).
 
-# tcp_retransmit() and tcp_set_retx() (smallest_tcp 0.2.0): until that is
-# released, the commit of smallest_tcp pull request 14.
+# The last release. The next one measures the round trip (RFC 6298), so its
+# retransmission timeout comes back down after a loss
+# (https://github.com/n9wxu/smallest_tcp/issues/12): take it when released.
 FetchContent_Declare(smallest_tcp
     GIT_REPOSITORY https://github.com/n9wxu/smallest_tcp.git
-    GIT_TAG        bd441b6895339b28b6baa6f70843b8a618a16796
+    GIT_TAG        v0.1.11
+    GIT_SHALLOW    TRUE
     SOURCE_SUBDIR  _sources_only)
 FetchContent_MakeAvailable(smallest_tcp)
 

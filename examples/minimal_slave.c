@@ -1,6 +1,5 @@
 /* The smallest useful slave: answers ARP and ping at 10.55.0.3 through the
- * link, resends lost TCP segments at the next idle poll, and resets if the
- * master stops answering. A firmware adds its own
+ * link, and resets if the master stops answering. A firmware adds its own
  * UDP and TCP services to the same stack (smallest_tcp's udp_set_ports(),
  * tcp_set_connections()).
  *
@@ -13,7 +12,6 @@
 #include "link485_config.h"
 #include "linkcheck.h"
 #include "net.h"
-#include "tcplink.h"
 #include "tmp_v2.h"
 
 static net_t   net;
@@ -33,7 +31,6 @@ int main(void)
     net.gateway_ipv4 = NET_IPV4(10, 55, 0, 1);      /* the master's tap interface */
     net.mtu = LINK485_FRAME_MAX - 14u;               /* so TCP's MSS fits our frames */
     linkcheck_init(&net);
-    tcplink_init(&net);                              /* the poll is TCP's clock on the link */
 
     uint32_t last_ms = hdx_millis();
     for (;;) {
