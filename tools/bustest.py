@@ -13,6 +13,9 @@ direction:
   silent   nothing at all                     the slave did not take the poll:
                                               master -> slave error, or none
 
+Its polls do not set ARQ (acknowledged delivery), so the slave answers best
+effort and every error shows here instead of being repaired by the next poll.
+
 Phases, in this order, each reported on its own:
 
   --listen S   listen to the idle line for S seconds without polling

@@ -28,7 +28,7 @@ to receive.
 | `hdx_millis()` | A free-running millisecond count; wrapping is fine. |
 | `hdx_reset()` | Reset the device. |
 
-Why each rule exists is in `docs/PROTOCOL.md` §5. Two mistakes look like a
+Why each rule exists is in `docs/PROTOCOL.md` §6. Two mistakes look like a
 working port but are not:
 
 - **Waiting for "buffer empty" instead of "transmit complete".** The last
