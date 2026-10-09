@@ -33,7 +33,8 @@ answers with errors (CRC failures, partial replies).
    2     VER<<4 | TYPE    1     VER = 2
    3     ADDR             1     0x01 the slave; 0x00 broadcast
    4     SEQ              1     the master counts; the slave echoes
-   5     FLAGS            1     0 here (bit 0 = compressed, bits 4-7 = dictionary: unused)
+   5     FLAGS            1     bit 1 = RETRY, in a POLL (§5); bit 0 = compressed and
+                                bits 4-7 = dictionary: unused
    6     LEN              2     payload length, big-endian, 0..1522
    8     payload          LEN
  8+LEN   CRC-32           4     big-endian, over VER..payload
@@ -69,53 +70,66 @@ how the slave tells its echo from the master's poll.
    `NET`: the same `SEQ`, carrying the oldest frame in its outbound queue if
    there is one. One `0xFF` byte goes before the frame (§6, rule 2).
 3. The master writes the slave's frame (if any) to the tap interface. If it
-   is a TCP segment its host must acknowledge, it waits for the host's
-   answer (§5). Then it polls again; when neither direction carried a frame
-   it naps 0.5 ms first, so an idle link costs little CPU.
-4. A poll the slave does not answer at all was not heard (it answers every
-   good poll), so its frame goes again in the next poll. A poll answered,
-   however damaged the answer, was heard: its frame is not repeated, and a
-   damaged answer is lost, as on Ethernet. TCP recovers it (§5).
+   is a TCP segment its host must acknowledge, it waits briefly for the
+   host's answer (§5). Then it polls again with the next `SEQ`; when neither
+   direction carried a frame it naps 0.5 ms first, so an idle link costs
+   little CPU.
+4. A reply that is damaged or missing is not handed over: the master sends
+   the same poll again, with `RETRY` (§5).
 
 The frame a poll carries is handed to the slave's IP stack after the reply
 has gone, so the answer to it (an ARP reply, an echo reply, a TCP segment)
 leaves with the *next* poll. A ping therefore takes two exchanges: request
 down, reply up.
 
-## 5. TCP over the link: the poll is the clock
+## 5. Damage: the link retries
 
-The link adds no acknowledgements of its own: TCP's are enough. What the
-link adds is knowing *when* an acknowledgement is due, so that TCP need not
-wait out a blind retransmission timeout on the one hop where it can know.
+A damaged frame is repaired on the link, where it happened, and at once. The
+master is the one party that knows: it sees a reply fail its CRC or stop
+short within a few milliseconds of its poll, or not come at all within the
+response window. TCP would only infer the loss from a missing
+acknowledgement, after a retransmission timeout (a second, on the slave),
+and take it for congestion, which a corrupted frame on this wire is not. The
+link's retry also covers every frame, not only TCP's: ARP, ping, UDP, and
+TCP's own acknowledgements. End-to-end recovery stays with TCP (RFC 3819
+§8); the link's is there to make it rare, and is bounded so that it never
+competes with TCP's (RFC 3366).
 
-- **The master hands each segment to its host and waits for the answer.**
-  When a reply carries a TCP segment the host must acknowledge (data, a SYN
-  or a FIN, for the host's own address), the master waits, up to 5 ms
-  (`tmptun -w`), until the host has something to send before it polls
-  again. The host acknowledges at once: the link's route has `quickack`
-  (`tunnel-up.sh`), so there are no delayed ACKs. The ACK rides the next
-  poll.
-- **An idle poll means "not acknowledged".** A poll that carries nothing
-  for the slave, arriving while nothing of the slave's waits to go, tells it
-  the master has nothing more for it: so a segment it sent to the host and
-  that is still unacknowledged never arrived. The slave sends it again in
-  the reply to that very poll (`slave/tcplink.c`, smallest_tcp's
-  `tcp_retransmit()`). A damaged reply costs one more exchange, a few
-  milliseconds, instead of a timeout of a second that doubles.
-- **A poll that carries a frame is not idle.** The host's ACK may be queued
-  behind other frames; the slave waits for the poll that comes empty.
-- **Peers beyond the master keep TCP's timer.** A segment for a host the
-  master routes to is answered when that host answers; the link cannot
-  know when, so those connections retransmit on TCP's own timeout. "On the
-  link" is the slave's own subnet.
-- **TCP's timer stays as the last resort.** `tcp_retransmit()` leaves it
-  running from the first send, so a link that keeps losing a segment still
-  ends the connection after R2 timeouts.
-
-The other way, a segment from the host that the slave never heard comes
-again in the next poll (§4, step 4). A slave's acknowledgement lost in a
-damaged reply is the one case left to TCP's timer: the host's (200 ms or
-more on Linux), since nothing after it tells the master an ACK was due.
+- **The master asks again.** A reply that failed its CRC, stopped short,
+  echoed the wrong `SEQ` or did not come at all is not handed over. The
+  master sends the same poll again at once: the same `SEQ`, the same frame
+  for the slave (if it carried one), and `RETRY` set. A poll whose own
+  frame the slave did not hear is repaired the same way.
+- **The slave answers the same again.** A poll with `RETRY` and the `SEQ`
+  of the slave's last reply gets that reply again, byte for byte. (If the
+  last reply carried nothing, this one may carry a frame queued since.) The
+  poll's frame is the one the slave took the first time, and it is not
+  taken twice. Any other poll is a new exchange: one without `RETRY`, one
+  with another `SEQ`, or any poll to a slave that has not replied since it
+  started. A new exchange tells the slave that its last reply arrived, so
+  the frame it carried leaves the queue only then; until then it stays at
+  the head, and costs no extra buffer.
+- **Bounded.** After `tmptun -n` tries (4 by default, `TMP_RETRY_LIMIT`)
+  the master gives up on the exchange and polls anew; whatever it carried
+  is lost, and TCP or the application retries it. A try costs at most the
+  poll's time on the wire and the response window: 1534 bytes at 20 µs and
+  100 ms, 131 ms. So 1 + 4 tries hold a frame at most 0.65 s, under the 1 s
+  minimum retransmission timeout of the slave's TCP, and `tmptun` warns
+  when `-n` and `-r` allow 1 s or more. A damaged reply, the usual case,
+  costs a few milliseconds a try; only a poll that gets no answer at all
+  costs the whole window. The master's host's TCP may time out sooner (on
+  Linux, from about 200 ms): a frame for the slave held that long by
+  unanswered polls may meet the host's own retransmission, a duplicate that
+  TCP discards (RFC 3819 §8.1).
+- **TCP's timer is the backstop.** A frame given up, or dropped by a full
+  queue, is recovered end to end by TCP's own retransmission timeout, with
+  its usual backoff.
+- **The host answers at once.** When a reply carries a TCP segment its host
+  must acknowledge (data, a SYN or a FIN, for the host's own address), the
+  master waits up to 5 ms (`tmptun -w`) for the host's answer before it
+  polls again, and the link's route has `quickack` (`tunnel-up.sh`), so
+  the ACK rides the next poll. Both only save time; nothing depends on
+  them.
 
 ## 6. Timing rules
 
@@ -163,8 +177,8 @@ Each of these was found the hard way on real hardware.
   ICMP echo carries at most 558 bytes of data.
 - **Queues are shallow on purpose.** The slave holds `LINK485_OUTBOUND_SLOTS`
   (6) frames and drops the next when full; the master takes one frame from
-  the kernel per poll, and gives a frame the slave does not hear up after 8
-  tries (`tmptun -n`). A full queue is the backpressure: TCP sees the loss
+  the kernel per poll, and gives an exchange up after 4 tries (`tmptun -n`,
+  §5). A full queue is the backpressure: TCP sees the loss
   and slows down within a round trip, instead of piling up seconds of
   latency in deep buffers.
 
@@ -186,4 +200,5 @@ creates it with multicast and IPv6 off. A master that also has WiFi or
 Ethernet and runs mDNS would otherwise reflect multicast between the
 networks, and on a slow link that storm can take both down. ARP is broadcast,
 not multicast, so ping and TCP are unaffected. It also gives the link's
-route `quickack`, so the host acknowledges every TCP segment at once (§5).
+route `quickack`, so the host acknowledges every TCP segment at once and
+the acknowledgement rides the next poll (§5).

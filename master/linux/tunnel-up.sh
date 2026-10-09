@@ -21,9 +21,9 @@ ip addr add "$ADDR" dev "$IFACE"
 ip link set "$IFACE" up mtu 1500
 
 # The host acknowledges every TCP segment on the link at once, with no
-# delayed ACK: the slave takes a poll that brings no ACK for a lost segment
-# (tmptun waits for the answer before polling again). quickack on the link's
-# own route does that for every connection over it.
+# delayed ACK, so the ACK rides the next poll (tmptun waits briefly for it
+# before polling again). It saves latency; nothing depends on it. quickack on
+# the link's own route does that for every connection over it.
 PREFIX=$(ip -4 route show dev "$IFACE" proto kernel scope link | awk 'NR == 1 { print $1 }')
 ip route change "$PREFIX" dev "$IFACE" proto kernel scope link src "${ADDR%/*}" quickack 1
 

@@ -7,19 +7,20 @@
  * transceiver must switch direction by itself (automatic direction control),
  * and the reply is read with poll(), never tcdrain().
  *
- * The poll is TCP's clock on the link. A segment the slave sends to this host
- * is handed to the kernel, and the master waits (-w) for the kernel's answer,
- * its ACK, before it polls again, so the next poll carries it. A reply that
- * arrived damaged is never handed over, and the next poll goes out at once
- * with nothing in it: to the slave (halfduplex-tcpip's tcplink), a poll with
- * nothing for it is the sign that what it sent was not acknowledged, and it
- * sends it again in that very reply. TCP's own ACKs carry the decision; no
- * timer waits blind. The host must acknowledge at once (no delayed ACKs):
- * tunnel-up.sh gives the link's route quickack.
+ * The link repairs what it damages. A reply that is damaged or missing (a
+ * CRC failure, a reply cut short or with the wrong SEQ, or no reply at all) is
+ * never handed over, and the same poll goes again at once: the same SEQ, the
+ * same frame, and TMP_FLAG_RETRY. The slave answers with the same reply, and
+ * takes the poll's frame only once, so either direction's frame gets through
+ * on a later try. After -n tries the master gives up on the exchange and polls
+ * anew; TCP's own timer recovers what it carried. The limit keeps the time
+ * the link holds a frame well under TCP's retransmission timeout (RFC 3366):
+ * a try costs at most the poll's time on the wire plus the response window.
  *
- * The other way, a poll the slave does not answer at all was not heard (the
- * slave answers every good poll), so its frame goes again in the next one;
- * a poll answered, however badly, was heard, and its frame is not repeated.
+ * A TCP segment the slave sends to this host is handed to the kernel, and the
+ * master waits (-w) for the kernel's answer, its ACK, before it polls again,
+ * so the next poll carries it; tunnel-up.sh gives the link's route quickack.
+ * Both save time, and nothing depends on them.
  *
  * Timing is the half-duplex turn: a reply must start within the slave's
  * response window (-r) after the poll has left; once it starts, its length
@@ -33,15 +34,18 @@
  *   -w  after handing the host a TCP segment it must acknowledge (data, SYN
  *       or FIN, for the tap's own address), wait this long at most for its
  *       answer before polling again, in microseconds (default 5000)
- *   -n  times a frame goes again after polls that were not heard (default 8)
+ *   -n  times an exchange whose reply was damaged or missing is tried again
+ *       (TMP_FLAG_RETRY) before the master gives up on it (default 4: at most
+ *       5 x (31 ms for a full poll + the 100 ms window) = 0.65 s, well under
+ *       TCP's 1 s retransmission timeout)
  *   -r  the slave's response window: how long after the poll has left its
  *       reply may start, in ms (default 100: a slave that writes flash before
  *       answering takes tens of ms). Never shorter than the slave's slowest
  *       answer: a poll sent while the slave is answering collides with it
  *   -f  fault injection: treat every nth intact reply of an exchange that
- *       carried a frame as damaged
+ *       carried a frame as damaged, so the exchange is tried again
  *   -s  fault injection: damage every nth poll that carries a frame, so the
- *       slave does not hear it
+ *       slave does not hear it and the exchange is tried again
  *   -g  hold a poll that follows a frame-carrying exchange this long, in
  *       microseconds (a diagnostic for a slave that cannot hear the bus right
  *       after its reply)
@@ -134,7 +138,7 @@ static const char *const result_names[RESULTS] = {
 static struct {
     unsigned long polls, results[RESULTS];
     unsigned long frames_down, frames_up, bytes_down, bytes_up;
-    unsigned long down_again, down_dropped, polls_damaged;
+    unsigned long retries, repaired, given_up, polls_damaged;
     /* the host's answers to segments handed to it */
     unsigned long host_answers, host_silent;
     long          host_min_us, host_max_us, host_sum_us;
@@ -156,14 +160,15 @@ struct outcome {
 /* One poll and its reply. The reply has to start within the response window
  * after the poll has left; once it has started, the frame's length (or, until
  * the length is known, the longest frame) sets when it must be complete. */
-static enum result poll_for_reply(int serial_fd, uint8_t sequence, bool damage,
+static enum result poll_for_reply(int serial_fd, uint8_t sequence, bool retry, bool damage,
                                   const uint8_t *down_frame, uint16_t down_length,
                                   struct tmp_scanner *scanner, struct tmp_frame *reply,
                                   struct outcome *outcome)
 {
     static uint8_t wire[TMP_FRAME_MAX];
+    const uint8_t flags = (uint8_t)(tmp_flags(false, 0u) | (retry ? TMP_FLAG_RETRY : 0u));
     const size_t wire_length = tmp_frame_build(wire, TMP_POLL, TMP_ADDR_COLLECTOR, sequence,
-                                               tmp_flags(false, 0u), down_frame, down_length);
+                                               flags, down_frame, down_length);
     memset(outcome, 0, sizeof *outcome);
     if (damage) {
         wire[wire_length - 1u] ^= 0xFFu;    /* a CRC the slave will not accept */
@@ -291,8 +296,8 @@ static void print_totals(double seconds, long gap_us)
     }
     printf("\n  frames down %lu (%lu B), up %lu (%lu B)\n", stats.frames_down, stats.bytes_down,
            stats.frames_up, stats.bytes_up);
-    printf("  frames sent again after a poll not heard %lu, dropped %lu; polls damaged on "
-           "purpose %lu\n", stats.down_again, stats.down_dropped, stats.polls_damaged);
+    printf("  polls tried again %lu: exchanges repaired %lu, given up %lu; polls damaged on "
+           "purpose %lu\n", stats.retries, stats.repaired, stats.given_up, stats.polls_damaged);
     if (stats.host_answers != 0u) {
         printf("  host answered %lu segments: min %ld us, mean %ld us, max %ld us; "
                "not within the wait %lu\n", stats.host_answers, stats.host_min_us,
@@ -326,7 +331,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     bool verbose = false;
-    long run_s = 0, gap_us = 0, host_wait_us = 5000, max_tries = 8;
+    long run_s = 0, gap_us = 0, host_wait_us = 5000, max_tries = TMP_RETRY_LIMIT;
     unsigned long damage_every = 0u, frame_polls = 0u;
     int option;
     while ((option = getopt(argc, argv, "vt:w:n:r:f:s:g:")) != -1) {
@@ -342,8 +347,8 @@ int main(int argc, char **argv)
         default: usage(); return 2;
         }
     }
-    if (optind >= argc || max_tries < 0 || host_wait_us < 0 || reply_window_us <= 0
-        || inject_every == 1u || damage_every == 1u) {
+    if (optind >= argc || max_tries < 0 || max_tries > 255 || host_wait_us < 0
+        || reply_window_us <= 0 || inject_every == 1u || damage_every == 1u) {
         usage();
         return 2;
     }
@@ -362,6 +367,12 @@ int main(int argc, char **argv)
             serial_device, tap_name, TMP_V2_BAUD, reply_window_us / 1000L, host >> 24,
             (host >> 16) & 0xFFu, (host >> 8) & 0xFFu, host & 0xFFu,
             host == 0u ? " (none: its answers are not waited for)" : "");
+    const long longest_hold_us = (max_tries + 1L) * ((long)TMP_FRAME_MAX * BYTE_US + reply_window_us);
+    if (longest_hold_us >= 1000000L) {
+        fprintf(stderr, "tmptun: -n %ld with a %ld ms window can hold a frame %ld ms, past TCP's "
+                        "1 s retransmission timeout\n", max_tries, reply_window_us / 1000L,
+                longest_hold_us / 1000L);
+    }
 
     struct tmp_scanner scanner = { 0 };
     tmp_scanner_reset(&scanner);
@@ -372,8 +383,8 @@ int main(int argc, char **argv)
     const long started_us = monotonic_us();
     long last_end_us = 0;
     bool last_carried = false;
-    uint16_t down_length = 0u;      /* a frame for the slave, kept while polls go unheard */
-    long tries = 0;
+    uint16_t down_length = 0u;      /* a frame for the slave, kept while the exchange is retried */
+    uint8_t tries = 0u;             /* retries of the exchange in hand (tmp_retry()) */
 
     while (!stopping && (run_s == 0 || monotonic_us() - started_us < run_s * 1000000L)) {
         if (down_length == 0u) {
@@ -386,28 +397,30 @@ int main(int argc, char **argv)
         const bool damage = damage_every != 0u && down_length != 0u
                          && ++frame_polls % damage_every == 0u;
         stats.polls_damaged += damage;
-        const enum result result = poll_for_reply(serial_fd, sequence, damage,
+        const bool retry = tries != 0u;
+        const uint8_t polled_sequence = sequence;
+        const enum result result = poll_for_reply(serial_fd, sequence, retry, damage,
                                                   down_length ? down_frame : NULL, down_length,
                                                   &scanner, &reply, &outcome);
         stats.results[result]++;
         bool carried = down_length != 0u;
 
-        if (down_length != 0u) {
-            if (result == SILENT && tries < max_tries) {
-                /* Not heard: the slave answers every good poll. Its frame goes
-                 * again with the next one. */
-                tries++;
-                stats.down_again++;
-            } else {
-                if (result == SILENT) {
-                    stats.down_dropped++;
-                } else {
+        /* Damaged or missing: the same poll again, SEQ, frame and all, with
+         * TMP_FLAG_RETRY; past the limit, the exchange is given up. */
+        if (tmp_retry(&tries, result == ANSWERED, (uint8_t)max_tries)) {
+            stats.retries++;
+        } else {
+            if (result == ANSWERED) {
+                stats.repaired += retry;
+                if (down_length != 0u) {
                     stats.frames_down++;
                     stats.bytes_down += down_length;
                 }
-                down_length = 0u;
-                tries = 0;
+            } else {
+                stats.given_up++;
             }
+            down_length = 0u;
+            sequence++;
         }
 
         if (result == ANSWERED && reply.length != 0u) {
@@ -435,8 +448,8 @@ int main(int argc, char **argv)
         }
 
         if (result != ANSWERED && verbose) {
-            printf("seq %u: %s (frame %s, heard %zu B", sequence, result_names[result],
-                   down_length != 0u ? "kept" : "none or gone", outcome.heard);
+            printf("seq %u: %s (%s, heard %zu B", polled_sequence, result_names[result],
+                   tries != 0u ? "trying again" : "given up", outcome.heard);
             for (size_t index = 0u; index < outcome.heard && index < sizeof outcome.first;
                  index++) {
                 printf("%s %02x", index == 0u ? ":" : "", outcome.first[index]);
@@ -446,7 +459,6 @@ int main(int argc, char **argv)
         }
         last_end_us = monotonic_us();
         last_carried = carried;
-        sequence++;
         /* Idle, nap; after a failure or a frame, poll again at once. */
         if (result == ANSWERED && !carried && down_length == 0u) {
             const struct timespec nap = { .tv_sec = 0, .tv_nsec = IDLE_NAP_NS };

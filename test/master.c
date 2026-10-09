@@ -67,6 +67,23 @@ void poll(uint8_t address, const uint8_t *frame, size_t length)
     poll_as(address, (uint8_t)(sequence + 1u), tmp_flags(false, 0u), frame, length);
 }
 
+void poll_again(uint8_t address, const uint8_t *frame, size_t length)
+{
+    poll_as(address, sequence, (uint8_t)(tmp_flags(false, 0u) | TMP_FLAG_RETRY), frame, length);
+}
+
+int exchange(uint8_t address, const uint8_t *frame, size_t length, int damaged, uint8_t limit)
+{
+    uint8_t tries = 0u;
+    int     polls = 1;
+    poll(address, frame, length);
+    while (tmp_retry(&tries, answered && polls > damaged, limit)) {
+        poll_again(address, frame, length);
+        polls++;
+    }
+    return polls;
+}
+
 /* ── Frame builders ─────────────────────────────────────────────────── */
 
 uint16_t checksum(const uint8_t *data, size_t length, uint32_t sum)

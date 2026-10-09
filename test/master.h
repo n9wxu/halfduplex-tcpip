@@ -46,6 +46,14 @@ void poll(uint8_t address, const uint8_t *frame, size_t length);
 /* A poll with a given SEQ and FLAGS (poll() counts SEQ up and sends none). */
 void poll_as(uint8_t address, uint8_t poll_sequence, uint8_t flags, const uint8_t *frame,
              size_t length);
+/* The last poll again, as a master whose reply was damaged or missing sends
+ * it: the same SEQ, with TMP_FLAG_RETRY, carrying `frame` (the same one). */
+void poll_again(uint8_t address, const uint8_t *frame, size_t length);
+/* One exchange by tmptun's rule (tmp_retry(), `limit` retries): a poll with
+ * the next SEQ, and while its reply counts as damaged, the same poll again.
+ * The first `damaged` replies count as damaged, as if the wire had broken
+ * them. Returns the polls sent; `answer` is the last reply. */
+int  exchange(uint8_t address, const uint8_t *frame, size_t length, int damaged, uint8_t limit);
 
 /* Frame builders; each returns the header length. */
 uint16_t checksum(const uint8_t *data, size_t length, uint32_t sum);
