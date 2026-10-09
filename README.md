@@ -4,8 +4,9 @@ Real TCP/IP between a Linux host and a microcontroller over one two-wire
 RS-485 pair. The Linux side gets an ordinary Ethernet interface; the
 microcontroller gets an IP stack with ping, UDP and TCP. Between them,
 a polled, collision-free link carries one Ethernet frame each way on every
-exchange, and acknowledges each one, so a damaged frame is sent again on the
-very next poll instead of waiting for TCP.
+exchange. TCP runs end to end over it, and on the link the master's polls
+are TCP's clock: a segment that did not arrive goes again at the next poll,
+instead of after a retransmission timeout.
 
 ```
   Linux host (master)                                   microcontroller (slave)
@@ -21,9 +22,10 @@ very next poll instead of waiting for TCP.
 
 Measured on a SAMD21 (Cortex-M0+, 48 MHz) slave and a Raspberry Pi CM4
 master: **ping in 8.9 ms**, **~16 kB/s each way at the same time**, and no
-corrupted frame in 73 Mbit of traffic, and with one reply in ten deliberately
-corrupted, nothing lost ([benchmarks](#benchmarks)). The slave side costs
-2.2 KB of flash plus the IP stack.
+corrupted frame in 73 Mbit of traffic, and with one frame-carrying reply in
+ten deliberately damaged, no TCP data lost and no retransmission timeout
+([benchmarks](#benchmarks)). The slave side costs 2.1 KB of flash plus the
+IP stack.
 
 ## The problem
 
@@ -72,14 +74,18 @@ sockets in any language) to work unchanged. The usual options fall short:
 - **Every frame has sync bytes, a length and a CRC-32**, the same CRC as
   Ethernet. Receivers resynchronise on garbage and drop any frame that fails
   its CRC.
-- **The master's polls are the clock, and every frame is acknowledged.**
-  Each poll acknowledges the slave's last frame and carries the master's
-  next; each reply does the same the other way. A frame the other end did
-  not get intact is not acknowledged, so it simply goes again in the next
-  message, a couple of milliseconds later. Nobody asks for a resend and no
-  timer decides one, and a repeated frame is recognised and not taken
-  twice. TCP's own retransmission, which waits a second or more and backs
-  off from there, is left for a link that is actually down.
+- **The poll is TCP's clock on the link.** TCP's own acknowledgements
+  decide what is resent; the link adds no signalling. The master hands each
+  segment from the slave to its host and waits (microseconds, in practice)
+  for the host's ACK before polling again, and the host acknowledges at
+  once (a `quickack` route). So a poll that brings the slave nothing, after
+  it sent a segment, means the segment never arrived: the slave sends it
+  again in its reply to that very poll (`slave/tcplink.c`, with
+  smallest_tcp's `tcp_retransmit()`), a few milliseconds later instead of
+  a second later and doubling. Peers beyond the master, reached through a
+  router, answer when they answer, so their connections keep TCP's normal
+  timeout. The other way, a poll the slave did not hear at all is sent
+  again by the master at once.
 - **The timing rules live in one place.** The hardware half of the slave is
   a six-function HAL whose contract spells out the turnaround, the preamble,
   the driver-enable hold and the moment the echo may be discarded
@@ -100,9 +106,9 @@ control, `tmptun` from this repo. Slave: SAMD21G18A at 48 MHz on the SAMD21
 port, smallest_tcp v0.1.10, `LINK485_FRAME_MAX` 600, 1 ms turnaround, built
 with arm-none-eabi-gcc 13.2 `-Os`. The slave is a working device (it also
 streams four VE.Direct serial ports), on a trailer's installed RS-485 cable.
-Measured 2026-10-08. The latency, throughput and integrity figures predate
-acknowledged delivery, which adds no bytes to any frame; the empty exchange
-measured the same with it (2.29 ms mean).
+Measured 2026-10-08. The latency, throughput and integrity figures were
+taken before the poll-clocked retransmission, which adds no bytes to any
+frame; the empty exchange measured the same with it (2.31 ms mean).
 
 ### Latency
 
@@ -194,24 +200,27 @@ inverter's stream dropped every 20 s. smallest_tcp retransmitted it after
 one segment in flight, the 512-byte serial buffer behind it overflowed from
 the second loss on: holes of 2.5 to 16.5 s, and corrupted blocks.
 
-**Now: acknowledged by the next poll.** `tmptun -f 10` treats one in ten
-replies of every exchange that carried a frame as corrupted:
+**Now: the poll is TCP's clock.** Three 70–80 s runs on the live streams
+(ports 1, 2 and 4) with a ping every 100 ms, `tmptun -t` in the master's
+place:
 
-| Run | Replies corrupted | VE.Direct blocks | Pings | Frames sent again (master / slave) |
-|---|---:|---|---|---|
-| 130 s | 319 | 477 of 477 intact, no gaps | 1000 of 1000, no duplicates | 168 / 160 |
-| 75 s | 186 | 257 of 257 intact, no gaps | 600 of 600, no duplicates, worst 25 ms | 85 / 104 |
+| Run | Damage on purpose | VE.Direct blocks | Pings | What repaired it |
+|---|---|---|---|---|
+| none | — | 238 of 238 intact | 580 of 580 | nothing to repair: no retransmission at all, so none spurious |
+| `-f 10` | 197 replies of frame-carrying exchanges | 277 of 277 intact, none late | 85 % (ICMP has no retransmission) | 19 TCP segments sent again at the next idle poll |
+| `-s 10` | 109 polls that carried a frame | 277 of 277 intact | 680 of 680, no duplicates | the master sent all 109 again |
 
-Every corrupted reply was repaired by the next poll. In the second run,
-with the master as published, the slave counted as duplicates exactly the 85
-frames the master sent again. (The first run's master did not yet start in
-step with the slave, which cost one frame at its start.) Restarting the
-master three times under a 10-per-second ping lost nothing on the link; the
-restarts themselves cost two pings each while the service re-created the
-interface's address, and the one duplicate was an answer the old master had
-taken but not yet acknowledged.
-A deterministic link should own its retries, not the TCP timer:
-[smallest_tcp#13](https://github.com/n9wxu/smallest_tcp/issues/13).
+The host acknowledged each of 857 segments within 3 to 112 µs of receiving
+it, so every ACK rode the very next poll. No TCP segment on the link waited
+for a retransmission timeout: one would have shown as a block over a second
+late (none came more than 0.9 s after the last on the 0.5 s stream, or 1.6 s
+on the 1 s streams). A poll the slave did not hear costs the response window
+(100 ms) before it goes again; in tens of thousands of polls without
+injection, none went unheard. TCP's own
+timeouts are now the last resort, and back off properly when they do run:
+[smallest_tcp#14](https://github.com/n9wxu/smallest_tcp/pull/14) adds
+`tcp_retransmit()` and `tcp_set_retx()` and fixes
+[#12](https://github.com/n9wxu/smallest_tcp/issues/12).
 
 ### Footprint
 
@@ -219,11 +228,12 @@ SAMD21 port, arm-none-eabi-gcc 13.2 `-Os`, Cortex-M0+:
 
 | | Flash | RAM |
 |---|---:|---:|
-| `link485.c`: TMP-v2 slave, acknowledged delivery, MAC driver | 1 418 B | 7 323 B |
+| `link485.c`: TMP-v2 slave and MAC driver | 1 214 B | 7 320 B |
 | `linkcheck.c` | 152 B | 14 B |
+| `tcplink.c`: the poll as TCP's clock | 128 B | 8 B |
 | `hdx_hal_samd21.c` | 608 B | 2 060 B |
-| **link layer** | **2 178 B** | **9 397 B** |
-| smallest_tcp: IPv4, ARP, ICMP, UDP, TFTP, TCP | 11 747 B | — |
+| **link layer** | **2 102 B** | **9 402 B** |
+| smallest_tcp: IPv4, ARP, ICMP, UDP, TFTP, TCP | 12 263 B | — |
 
 The RAM is buffers: six 600-byte outbound slots, room for one full-size
 inbound frame (the master's MTU is 1500), and the 2 KB receive ring. Fewer
@@ -243,6 +253,7 @@ include/tmp_v2.h          the wire format: frame build, scanner, CRC-32 (both en
 slave/                    the microcontroller side, portable C
   link485.c, .h             TMP-v2 slave and MAC driver for smallest_tcp
   linkcheck.c, .h           reachability check and reset
+  tcplink.c, .h             the poll as TCP's clock: resends on an idle poll
   hdx_hal.h                 the HAL: what a port provides
   link485_config.h          build-time settings and their defaults
 port/
@@ -271,14 +282,16 @@ sudo systemctl enable --now tmptun
 ping 10.55.0.3
 ```
 
-`tmptun <serial-device> [tap]` is the whole master. `-v` logs every
-exchange that failed, `-t <s>` runs for a while and prints totals (polls,
-answers and failures by kind, frames sent again, duplicates, the empty
-exchange's latency). `-r <ms>` sets the slave's response window (100 ms),
-`-n <polls>` the run of unanswered polls after which a pending frame is
-dropped (50), `-f <n>` corrupts every nth frame-carrying reply on purpose to
-exercise the recovery, and `-g <µs>` holds polls that follow a frame, to test
-a slave's release timing.
+`tmptun <serial-device> [tap]` is the whole master; `tunnel-up.sh` gives the
+link's route `quickack`. `-v` logs every exchange that failed, `-t <s>` runs
+for a while and prints totals (polls, answers and failures by kind, frames
+sent again, the host's ACK latency, the empty exchange's latency). `-w <µs>`
+is how long it waits for its host's answer to a segment (5000), `-r <ms>`
+the slave's response window (100), `-n` how often a poll the slave did not
+hear goes again (8). `-f <n>` damages every nth frame-carrying reply and
+`-s <n>` every nth frame-carrying poll on purpose, to exercise the
+recovery, and `-g <µs>` holds polls that follow a frame, to test a slave's
+release timing.
 
 ### The slave (microcontroller)
 
@@ -295,6 +308,7 @@ net.subnet_mask  = NET_IPV4(255, 255, 255, 0);
 net.gateway_ipv4 = NET_IPV4(10, 55, 0, 1);      /* the master's tap0 */
 net.mtu          = LINK485_FRAME_MAX - 14u;      /* so TCP's MSS fits */
 linkcheck_init(&net);
+tcplink_init(&net);         /* the poll is TCP's clock on the link */
 
 for (;;) {
     link485_service();       /* answer at most one poll */
@@ -305,6 +319,10 @@ for (;;) {
 ```
 
 The full version is [examples/minimal_slave.c](examples/minimal_slave.c).
+A server connection can end without an event: a reset in LAST-ACK, which
+Linux sends when data reaches a socket its application has closed, closes
+it silently. Listen again whenever the connection is CLOSED, not only on
+`TCP_EVT_CLOSED`, or the port stays shut.
 Services are smallest_tcp's: `udp_set_ports()` for UDP, `tcp_listen()` and
 `tcp_set_connections()` for TCP. Settings (frame size, queue depth, slave
 address, turnaround, link-check timing) are in
@@ -332,10 +350,12 @@ it, driven by a TMP-v2 master written into the test:
 
 - **link**: empty polls and the preamble; polls for another address and
   corrupted ones ignored, and recovery after noise; a poll right behind a
-  reply; acknowledged delivery (a reply the master did not acknowledge comes
-  again, a frame repeated by the master is taken once, best effort for a
-  master without ARQ); ARP, ping, a UDP datagram and a TCP SYN/SYN+ACK with
-  an MSS that fits; a full outbound queue dropping its surplus.
+  reply; ARP, ping, a UDP datagram and a TCP SYN/SYN+ACK with an MSS that
+  fits; a full outbound queue dropping its surplus; the idle-poll hook (only
+  a poll with no frame while nothing of ours waits); TCP on the link (an
+  unacknowledged SYN+ACK and data segment sent again at the next idle poll,
+  stopped by the ACK) and beyond it (a routed peer's segment left to TCP's
+  timer).
 - **linkcheck**: probes while the master answers, a reset only after the
   limit when it stops, and the same with no master at all.
 - **template_links**: a slave links against the template port alone.

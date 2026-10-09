@@ -8,15 +8,9 @@
 
 /* The RS-485 side: a TMP-v2 slave that the master polls. Each POLL may carry
  * one Ethernet frame for us; each reply carries one of ours, or none. This is
- * the stack's MAC driver.
- *
- * A master that sets TMP_FLAG_ARQ acknowledges every frame: our frame stays at
- * the head of the queue, and goes again with each reply, until a poll's ACK
- * moves past it; a frame of the master's whose SEQ we have already taken is
- * acknowledged again but not taken twice. No timer: the next poll is the
- * clock. Without ARQ a frame leaves the queue once sent (best effort). A
- * frame the queue has no room for is dropped, and TCP or the application
- * retries. */
+ * the stack's MAC driver. Best-effort: a frame that cannot be queued is
+ * dropped, and a frame lost on the wire is gone; TCP recovers it, and with
+ * tcplink.h it does so at the next idle poll instead of after a timeout. */
 
 extern const net_mac_t link485_mac;
 
@@ -31,6 +25,13 @@ void link485_service(void);
  * rather than talking. */
 void link485_set_before_reply(void (*hook)(void));
 
+/* Called for an idle poll: one that carries no frame for us, arriving while
+ * nothing of ours waits to go. The master has nothing more for us, and has
+ * had the chance to deliver everything we sent and pass back its host's
+ * answer. Called before the reply is built, so a frame the hook sends (a TCP
+ * retransmission, say: tcplink.h) leaves in this reply. */
+void link485_set_on_idle_poll(void (*hook)(void));
+
 /* Every byte on the wire, as received and as sent (a bus monitor). */
 void link485_set_tap(void (*tap)(bool transmitted, const uint8_t *data, size_t length));
 
@@ -41,9 +42,7 @@ uint32_t link485_poll_age_ms(void);
  * polls and replies do not count: the master polls without pause. */
 uint32_t link485_frames(void);
 
-/* Our frames sent again because a poll did not acknowledge them, and frames
- * of the master's received twice (our acknowledgement was lost), since reset. */
-uint32_t link485_resends(void);
-uint32_t link485_duplicates(void);
+/* Idle polls since reset. */
+uint32_t link485_idle_polls(void);
 
 #endif
