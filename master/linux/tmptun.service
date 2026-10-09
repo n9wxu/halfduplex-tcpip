@@ -1,0 +1,15 @@
+[Unit]
+Description=Half-duplex TCP/IP master (RS-485 <-> tap0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit the serial device, the interface and its address to suit.
+ExecStartPre=/usr/local/sbin/tunnel-up.sh tap0 10.55.0.1/24
+ExecStart=/usr/local/bin/tmptun /dev/ttyAMA3 tap0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
