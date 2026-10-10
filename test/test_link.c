@@ -327,6 +327,14 @@ int main(void)
     CHECK(answered && is_echo_reply(&answer, "rset"));
     poll(LINK485_ADDRESS, NULL, 0u);
 
+    /* So the master must not add a frame to a retry: the slave heard the
+     * first try, which carried none, and does not take it. */
+    poll(LINK485_ADDRESS, NULL, 0u);
+    poll_again(LINK485_ADDRESS, frame, ping(frame, "add?"));
+    CHECK(answered && answer.length == 0u);
+    poll(LINK485_ADDRESS, NULL, 0u);
+    CHECK(answered && answer.length == 0u);                 /* no echo */
+
     /* A poll asking again for another SEQ than our last reply's is a new
      * exchange too: that reply arrived, and its frame leaves the queue. */
     CHECK(datagram("seq") == NET_OK);

@@ -387,7 +387,11 @@ int main(int argc, char **argv)
     uint8_t tries = 0u;             /* retries of the exchange in hand (tmp_retry()) */
 
     while (!stopping && (run_s == 0 || monotonic_us() - started_us < run_s * 1000000L)) {
-        if (down_length == 0u) {
+        /* A new exchange takes the next frame from the tap. A retry carries
+         * the first try's frame, or none if it had none: the slave takes a
+         * retried poll's frame only when it never heard the first try, so a
+         * frame added to a retry would be lost. */
+        if (tries == 0u) {
             down_length = take_frame_from_tap(tap_fd, down_frame);
         }
         if (gap_us > 0 && last_carried) {

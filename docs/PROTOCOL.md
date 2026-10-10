@@ -98,7 +98,8 @@ competes with TCP's (RFC 3366).
 - **The master asks again.** A reply that failed its CRC, stopped short,
   echoed the wrong `SEQ` or did not come at all is not handed over. The
   master sends the same poll again at once: the same `SEQ`, the same frame
-  for the slave (if it carried one), and `RETRY` set. A poll whose own
+  for the slave (if it carried one, and none if it did not: a frame added
+  to a retry would not be taken), and `RETRY` set. A poll whose own
   frame the slave did not hear is repaired the same way.
 - **The slave answers the same again.** A poll with `RETRY` and the `SEQ`
   of the slave's last reply gets that reply again, byte for byte. (If the
