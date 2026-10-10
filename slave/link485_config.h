@@ -32,6 +32,15 @@
 #define RS485_TURNAROUND_US     1000u
 #endif
 
+/* Quiet on the bus after a poll for us that went bad (its CRC failed, or it
+ * stopped short) before the slave answers it with a NAK; a frame cut short is
+ * dropped then too. Counted in hdx_millis() ticks, so the quiet is at least
+ * one tick less than this: 1-2 ms by default, 50 bytes' time and more. The
+ * master must not pause that long inside a frame (docs/PROTOCOL.md §6). */
+#ifndef LINK485_QUIET_MS
+#define LINK485_QUIET_MS        2u
+#endif
+
 /* linkcheck: with no answer from the gateway for this long, reset. */
 #ifndef LINKCHECK_LOSS_RESET_S
 #define LINKCHECK_LOSS_RESET_S  600u

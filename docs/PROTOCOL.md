@@ -47,7 +47,9 @@ answers with errors (CRC failures, partial replies).
   noisy pair; the CRC is what keeps corrupted frames away from the IP stacks.
 - Receivers scan for `AA 55`, read the header, and resynchronise on anything
   that does not parse: a length over 1522, or a CRC that does not match. A bad
-  frame is dropped, never delivered. (`tmp_scanner_push()`.)
+  frame is dropped, never delivered. (`tmp_scanner_push()`.) The slave also
+  drops a frame cut short: one still incomplete when the bus has gone quiet
+  (§6, rule 8).
 
 ## 3. Frame types
 
@@ -55,12 +57,14 @@ answers with errors (CRC failures, partial replies).
 |---|---|---|---|
 | `TMP_POLL` | 0x1 | master → slave | nothing, or one Ethernet frame for the slave |
 | `TMP_NET` | 0x7 | slave → master | nothing, or one Ethernet frame for the master |
+| `TMP_NAK` | 0x5 | slave → master | nothing: a `POLL` for this slave went bad (§5) |
 
-The header also defines `REPORT`, `CMD`, `ACK`, `NAK` and `LOG`, and a
-compression flag, for the wider TMP-v2 family this link came from. This
-project uses only `POLL` and `NET`; a slave ignores everything but a `POLL`
-to its address or to broadcast. Each end also ignores its own type, which is
-how the slave tells its echo from the master's poll.
+The header also defines `REPORT`, `CMD`, `ACK` and `LOG`, and a compression
+flag, for the wider TMP-v2 family this link came from. This project uses
+only `POLL`, `NET` and `NAK`; a slave ignores everything but a `POLL` to its
+address or to broadcast, and a bad one to its own address. Each end also
+ignores its own type, which is how the slave tells its echo from the
+master's poll.
 
 ## 4. The exchange
 
@@ -75,7 +79,9 @@ how the slave tells its echo from the master's poll.
    direction carried a frame it naps 0.5 ms first, so an idle link costs
    little CPU.
 4. A reply that is damaged or missing is not handed over: the master sends
-   the same poll again, with `RETRY` (§5).
+   the same poll again, with `RETRY` (§5). So does a `NAK`: the slave sends
+   one, instead of a `NET`, for a poll to its address that failed its CRC or
+   stopped short, once the bus is quiet.
 
 The frame a poll carries is handed to the slave's IP stack after the reply
 has gone, so the answer to it (an ARP reply, an echo reply, a TCP segment)
@@ -101,6 +107,19 @@ competes with TCP's (RFC 3366).
   for the slave (if it carried one, and none if it did not: a frame added
   to a retry would not be taken), and `RETRY` set. A poll whose own
   frame the slave did not hear is repaired the same way.
+- **The slave says when a poll went bad.** A poll to the slave's own
+  address that fails its CRC, or stops short of its length, gets a `NAK`
+  with the `SEQ` as received, once the bus has been quiet for
+  `LINK485_QUIET_MS` (§6, rule 8): until then the rest of it may still be
+  coming, if the length field is what broke. The master tries again at once,
+  and the try costs a few milliseconds instead of the response window. The
+  `NAK` changes nothing in the slave: the poll's frame is not taken, and its
+  last reply stays as it was, so the next try is answered as if the bad poll
+  had never come. Its `SEQ` is not checked, since it may be what broke. A
+  bad frame whose header names another address, or broadcast, gets no `NAK`:
+  a damaged byte can make any frame look like one, and a broadcast would
+  have every slave answer at once. A poll the slave does not recognise at
+  all (its sync bytes or header broken) still costs the response window.
 - **The slave answers the same again.** A poll with `RETRY` and the `SEQ`
   of the slave's last reply gets that reply again, byte for byte. (If the
   last reply carried nothing, this one may carry a frame queued since.) The
@@ -117,11 +136,11 @@ competes with TCP's (RFC 3366).
   100 ms, 131 ms. So 1 + 4 tries hold a frame at most 0.65 s, under the 1 s
   minimum retransmission timeout of the slave's TCP, and `tmptun` warns
   when `-n` and `-r` allow 1 s or more. A damaged reply, the usual case,
-  costs a few milliseconds a try; only a poll that gets no answer at all
-  costs the whole window. The master's host's TCP may time out sooner (on
-  Linux, from about 200 ms): a frame for the slave held that long by
-  unanswered polls may meet the host's own retransmission, a duplicate that
-  TCP discards (RFC 3819 §8.1).
+  costs a few milliseconds a try, and so does a poll the slave `NAK`s; only
+  a poll that gets no answer at all costs the whole window. The master's
+  host's TCP may time out sooner (on Linux, from about 200 ms): a frame for
+  the slave held that long by unanswered polls may meet the host's own
+  retransmission, a duplicate that TCP discards (RFC 3819 §8.1).
 - **TCP's timer is the backstop.** A frame given up, or dropped by a full
   queue, is recovered end to end by TCP's own retransmission timeout, with
   its usual backoff.
@@ -166,6 +185,15 @@ Each of these was found the hard way on real hardware.
    moment it must be complete (20 µs a byte, plus 3 ms for the UART and the
    kernel). At that moment the master judges it and polls again. Only a poll
    that gets no answer at all costs the whole window.
+8. **Quiet before a NAK.** The slave answers a bad poll only once the bus
+   has been quiet for `LINK485_QUIET_MS` (2 ticks of its millisecond clock,
+   so 1–2 ms, 50 bytes' time and more), and then drops whatever frame it
+   was still reading. A poll whose length field broke ends earlier or later
+   than its header says; a `NAK` sent at once could start while the master
+   is still sending the rest of it. So the master must not pause that long
+   inside a frame, and the slave takes the first quiet after a cut-short
+   frame as its end, which also means the master's next try is read from
+   its own sync bytes rather than as the rest of the broken frame.
 
 ## 7. Sizes and queues
 

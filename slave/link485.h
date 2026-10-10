@@ -13,8 +13,11 @@
  * A reply the master did not get intact, it asks for again: the same SEQ
  * with TMP_FLAG_RETRY. So our frame stays at the head of the queue until a
  * new poll shows that it arrived, and the poll's own frame is taken once,
- * however often it comes. A frame the queue has no room for is dropped, and
- * one the master gave up on is gone; TCP or the application retries. */
+ * however often it comes. A poll for us that went bad (its CRC failed, or it
+ * stopped short) gets a NAK once the bus is quiet, so the master sends it
+ * again at once instead of waiting out its response window. A frame the queue
+ * has no room for is dropped, and one the master gave up on is gone; TCP or
+ * the application retries. */
 
 extern const net_mac_t link485_mac;
 
@@ -41,5 +44,8 @@ uint32_t link485_frames(void);
 
 /* Replies sent again because the master asked (TMP_FLAG_RETRY) since reset. */
 uint32_t link485_retries(void);
+
+/* Polls for us that went bad and got a NAK, since reset. */
+uint32_t link485_naks(void);
 
 #endif

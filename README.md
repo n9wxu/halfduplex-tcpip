@@ -23,7 +23,7 @@ instead of waiting out TCP's retransmission timeout.
 Measured on a SAMD21 (Cortex-M0+, 48 MHz) slave and a Raspberry Pi CM4
 master: **ping in 8.9 ms**, **~16 kB/s each way at the same time**, and no
 corrupted frame in 73 Mbit of traffic ([benchmarks](#benchmarks)). The slave
-side costs 2.0 KB of flash plus the IP stack.
+side costs 2.3 KB of flash plus the IP stack.
 
 ## The problem
 
@@ -73,8 +73,10 @@ sockets in any language) to work unchanged. The usual options fall short:
   Ethernet. Receivers resynchronise on garbage and drop any frame that fails
   its CRC.
 - **The link repairs its own damage.** The master knows within
-  milliseconds when a reply failed its CRC or stopped short, and within the
-  response window when none came. It
+  milliseconds when a reply failed its CRC or stopped short, and the slave
+  answers a poll that reached it damaged with a `NAK`, so the master knows
+  that within milliseconds too; only a poll the slave did not recognise at
+  all costs the response window. The master
   sends the same poll again at once, with the same `SEQ`, the same frame and
   a `RETRY` flag; the slave answers with the same reply, and takes the
   poll's frame only once. So a frame damaged in either direction goes again
@@ -104,8 +106,8 @@ port, smallest_tcp v0.1.10, `LINK485_FRAME_MAX` 600, 1 ms turnaround, built
 with arm-none-eabi-gcc 13.2 `-Os`. The slave is a working device (it also
 streams four VE.Direct serial ports), on a trailer's installed RS-485 cable.
 Measured 2026-10-08, before the link retry (`RETRY` is one flag bit and
-adds no bytes to any frame). The retry itself has not been measured on
-hardware yet.
+adds no bytes to any frame); the retry and the `NAK` were measured
+2026-10-09, under [Recovery](#recovery).
 
 ### Latency
 
@@ -189,8 +191,7 @@ now checks that a poll arriving right behind a reply is answered.
 
 What a damaged frame costs, measured on the slave's live VE.Direct TCP
 streams (one block every 0.5 s or 1 s per stream, each checksummed), with
-the two earlier designs. The link retry that replaced them is still to be
-measured on this hardware.
+the two earlier designs, and with the link retry that replaced them.
 
 **Best effort, with TCP left to recover.** One data segment of the
 inverter's stream dropped every 20 s. smallest_tcp retransmitted it after
@@ -217,12 +218,26 @@ the slave. It also depended on the host answering within the master's wait,
 and resent a TCP segment before its retransmission timeout, which RFC 6298
 §5 does not allow; pull request 14 was not merged.
 
-**Now: the link retries.** A damaged reply or a poll not heard is repaired
-by the master's `RETRY` poll a few milliseconds later, for every kind of
-frame, with TCP's own timeout (and, from smallest_tcp's next release, its
-round-trip measurement) as the end-to-end backstop. `tmptun -t` counts the
-exchanges repaired and given up, so the runs above can be repeated as they
-were.
+**Now: the link retries, and the slave `NAK`s a bad poll.** The same runs
+on 2026-10-09, with `tmptun -t` at its defaults (`-n 4`, `-r 100`,
+`-w 5000`), and one more with a reply and a poll in three damaged:
+
+| Run | Damage on purpose | What repaired it | VE.Direct blocks | Pings (RTT mean, max) |
+|---|---|---|---|---|
+| none | — | nothing to repair: no retry at all | 237 of 237 intact | 580 of 580 (10.8, 18.9 ms) |
+| `-f 10` | 205 replies | 205 retries, each at once | 277 of 277 intact | 680 of 680 (11.6, 25.7 ms) |
+| `-s 10` | 112 polls | 112 `NAK`s, 4.4–6.6 ms after the poll, and a retry each | 278 of 278 intact | 680 of 680 (11.6, 24.0 ms) |
+| `-f 3 -s 3` | 940 replies, 673 polls | 1 613 retries, 673 of them after a `NAK` | 276 of 276 intact | 680 of 680 (19.2, 43.7 ms) |
+
+No exchange was given up and nothing arrived twice. Every kind of frame got
+through, pings included. The `NAK` is what makes heavy damage cheap.
+Earlier the same day, with the retry alone (the slave silent to a bad
+poll), the `-f 3 -s 3` run spent 62 of its 80 s waiting out response
+windows. The link fell to 52 polls a second and about 10 frames each way,
+below what the streams produce: the slave's serial buffers overflowed,
+VE.Direct blocks were cut, and pings took up to 2 s. With the `NAK`, the link kept
+316 polls a second and carried as many frames as it does undamaged (1 006
+down and 1 003 up in 80 s, against 993 and 990 in the `-f 10` run).
 
 ### Footprint
 
@@ -230,10 +245,10 @@ SAMD21 port, arm-none-eabi-gcc 13.2 `-Os`, Cortex-M0+:
 
 | | Flash | RAM |
 |---|---:|---:|
-| `link485.c`: TMP-v2 slave and MAC driver, with the retry | 1 258 B | 7 319 B |
+| `link485.c`: TMP-v2 slave and MAC driver, with the retry and the `NAK` | 1 498 B | 7 329 B |
 | `linkcheck.c` | 152 B | 14 B |
 | `hdx_hal_samd21.c` | 608 B | 2 060 B |
-| **link layer** | **2 018 B** | **9 393 B** |
+| **link layer** | **2 258 B** | **9 403 B** |
 | smallest_tcp v0.1.11: IPv4, ARP, ICMP, UDP, TFTP, TCP | 12 059 B | — |
 
 The RAM is buffers: six 600-byte outbound slots, room for one full-size
@@ -285,8 +300,9 @@ ping 10.55.0.3
 `tmptun <serial-device> [tap]` is the whole master; `tunnel-up.sh` gives the
 link's route `quickack`, so the host's ACKs ride the next poll. `-v` logs
 every exchange that failed, `-t <s>` runs for a while and prints totals
-(polls, answers and failures by kind, exchanges repaired and given up, the
-host's ACK latency, the empty exchange's latency). `-w <µs>` is how long it
+(polls, answers and failures by kind, `NAK`s among them, exchanges repaired
+and given up, the host's ACK latency, the time to a `NAK`, the empty
+exchange's latency). `-w <µs>` is how long it
 waits for its host's answer to a segment (5000), `-r <ms>` the slave's
 response window (100), `-n` how often an exchange whose reply was damaged
 or missing is tried again before the master gives up on it (4). `-f <n>`
@@ -348,15 +364,20 @@ cmake -B build && cmake --build build && ctest --test-dir build
 The host tests run the slave on the test port with the real IP stack above
 it, driven by a TMP-v2 master written into the test:
 
-- **link**: empty polls and the preamble; polls for another address and
-  corrupted ones ignored, and recovery after noise; a poll right behind a
+- **link**: empty polls and the preamble; polls for another address
+  ignored, and recovery after noise; a poll right behind a
   reply; ARP, ping, a UDP datagram and a TCP SYN/SYN+ACK with an MSS that
   fits; a full outbound queue dropping its surplus; the link retry (a
   damaged reply asked for again and sent byte for byte, its slot freed only
   by the next new poll, a poll's frame taken once however often it comes, a
   poll not heard taken as new, a slave that reset taking a `RETRY` poll as
   new, the master giving up after `TMP_RETRY_LIMIT`, and a TCP segment
-  repaired by the link and sent once by TCP).
+  repaired by the link and sent once by TCP); the `NAK` (a damaged poll for
+  this slave NAKed with its `SEQ` only once the bus is quiet, and once; none
+  for another address or broadcast, or when a good poll followed; the
+  poll's frame not taken and the last reply kept for the next try; a poll
+  whose length broke NAKed when the bus goes quiet and the next try heard;
+  a pause inside a frame shorter than the quiet not cutting it).
 - **linkcheck**: probes while the master answers, a reset only after the
   limit when it stops, and the same with no master at all.
 - **template_links**: a slave links against the template port alone.

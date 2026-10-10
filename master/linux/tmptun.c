@@ -12,10 +12,13 @@
  * never handed over, and the same poll goes again at once: the same SEQ, the
  * same frame, and TMP_FLAG_RETRY. The slave answers with the same reply, and
  * takes the poll's frame only once, so either direction's frame gets through
- * on a later try. After -n tries the master gives up on the exchange and polls
- * anew; TCP's own timer recovers what it carried. The limit keeps the time
- * the link holds a frame well under TCP's retransmission timeout (RFC 3366):
- * a try costs at most the poll's time on the wire plus the response window.
+ * on a later try. A poll the slave saw go bad (its CRC failed, or it stopped
+ * short) it answers with a TMP_NAK, so that try costs a few milliseconds
+ * instead of the response window. After -n tries the master gives up on the
+ * exchange and polls anew; TCP's own timer recovers what it carried. The limit
+ * keeps the time the link holds a frame well under TCP's retransmission
+ * timeout (RFC 3366): a try costs at most the poll's time on the wire plus the
+ * response window.
  *
  * A TCP segment the slave sends to this host is handed to the kernel, and the
  * master waits (-w) for the kernel's answer, its ACK, before it polls again,
@@ -44,8 +47,9 @@
  *       answer: a poll sent while the slave is answering collides with it
  *   -f  fault injection: treat every nth intact reply of an exchange that
  *       carried a frame as damaged, so the exchange is tried again
- *   -s  fault injection: damage every nth poll that carries a frame, so the
- *       slave does not hear it and the exchange is tried again
+ *   -s  fault injection: damage every nth poll that carries a frame (its
+ *       CRC), so the slave NAKs it (a slave older than the NAK stays silent)
+ *       and the exchange is tried again
  *   -g  hold a poll that follows a frame-carrying exchange this long, in
  *       microseconds (a diagnostic for a slave that cannot hear the bus right
  *       after its reply)
@@ -130,9 +134,9 @@ static uint16_t take_frame_from_tap(int tap_fd, uint8_t *out)
 
 /* ── one exchange ──────────────────────────────────────────────────── */
 
-enum result { ANSWERED, SILENT, PARTIAL, CRC_FAILED, WRONG_SEQUENCE, INJECTED, RESULTS };
+enum result { ANSWERED, SILENT, PARTIAL, CRC_FAILED, WRONG_SEQUENCE, NAKED, INJECTED, RESULTS };
 static const char *const result_names[RESULTS] = {
-    "answered", "silent", "partial", "crc failed", "wrong seq", "injected"
+    "answered", "silent", "partial", "crc failed", "wrong seq", "nak", "injected"
 };
 
 static struct {
@@ -145,14 +149,16 @@ static struct {
     /* poll written -> reply complete, for exchanges with no frame */
     unsigned long empty_count;
     long          empty_min_us, empty_max_us, empty_sum_us;
-} stats = { .host_min_us = LONG_MAX, .empty_min_us = LONG_MAX };
+    /* poll written -> NAK complete */
+    long          nak_min_us, nak_max_us, nak_sum_us;
+} stats = { .host_min_us = LONG_MAX, .empty_min_us = LONG_MAX, .nak_min_us = LONG_MAX };
 
 static long reply_window_us = 100000L;
 static unsigned long inject_every;      /* -f */
 static unsigned long carrying_replies;  /* intact replies of frame-carrying exchanges */
 
 struct outcome {
-    long    reply_us;          /* poll written -> reply complete */
+    long    reply_us;          /* poll written -> reply (or NAK) complete */
     size_t  heard;             /* bytes received for this poll */
     uint8_t first[16];
 };
@@ -211,6 +217,12 @@ static enum result poll_for_reply(int serial_fd, uint8_t sequence, bool retry, b
             const enum tmp_scan_result scanned = tmp_scanner_push(scanner, chunk[index], reply);
             if (scanned == SCAN_CRC_FAILED) {
                 return CRC_FAILED;
+            }
+            if (scanned == SCAN_FRAME_READY && reply->type == TMP_NAK) {
+                /* The slave saw this poll go bad. Its SEQ may be what broke,
+                 * so the NAK's is not checked: either way, try again. */
+                outcome->reply_us = monotonic_us() - sent_us;
+                return NAKED;
             }
             if (scanned == SCAN_FRAME_READY && reply->type == TMP_NET) {
                 if (reply->sequence != sequence) {
@@ -305,6 +317,10 @@ static void print_totals(double seconds, long gap_us)
                stats.host_silent);
     } else if (stats.host_silent != 0u) {
         printf("  host answered no segment within the wait (%lu)\n", stats.host_silent);
+    }
+    if (stats.results[NAKED] != 0u) {
+        printf("  poll -> NAK: min %ld us, mean %ld us, max %ld us\n", stats.nak_min_us,
+               stats.nak_sum_us / (long)stats.results[NAKED], stats.nak_max_us);
     }
     if (stats.empty_count != 0u) {
         printf("  empty exchange: min %ld us, mean %ld us, max %ld us (%lu)\n",
@@ -444,6 +460,10 @@ int main(int argc, char **argv)
                     if (waited > stats.host_max_us) stats.host_max_us = waited;
                 }
             }
+        } else if (result == NAKED) {
+            stats.nak_sum_us += outcome.reply_us;
+            if (outcome.reply_us < stats.nak_min_us) stats.nak_min_us = outcome.reply_us;
+            if (outcome.reply_us > stats.nak_max_us) stats.nak_max_us = outcome.reply_us;
         } else if (result == ANSWERED && !carried) {
             stats.empty_count++;
             stats.empty_sum_us += outcome.reply_us;
