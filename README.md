@@ -249,7 +249,7 @@ SAMD21 port, arm-none-eabi-gcc 13.2 `-Os`, Cortex-M0+:
 | `linkcheck.c` | 152 B | 14 B |
 | `hdx_hal_samd21.c` | 608 B | 2 060 B |
 | **link layer** | **2 258 B** | **9 403 B** |
-| smallest_tcp v0.1.11: IPv4, ARP, ICMP, UDP, TFTP, TCP | 12 059 B | — |
+| smallest_tcp v0.1.12: IPv4, ARP, ICMP, UDP, TFTP, TCP | 12 309 B | — |
 
 The RAM is buffers: six 600-byte outbound slots, room for one full-size
 inbound frame (the master's MTU is 1500), and the 2 KB receive ring. Fewer

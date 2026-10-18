@@ -4,12 +4,12 @@ include(FetchContent)
 # packages' build files are not used (SOURCE_SUBDIR names a directory that does
 # not exist).
 
-# The last release. The next one measures the round trip (RFC 6298), so its
+# The last release: 0.1.12 measures the round trip (RFC 6298), so the
 # retransmission timeout comes back down after a loss
-# (https://github.com/n9wxu/smallest_tcp/issues/12): take it when released.
+# (https://github.com/n9wxu/smallest_tcp/issues/12).
 FetchContent_Declare(smallest_tcp
     GIT_REPOSITORY https://github.com/n9wxu/smallest_tcp.git
-    GIT_TAG        v0.1.11
+    GIT_TAG        v0.1.12
     GIT_SHALLOW    TRUE
     SOURCE_SUBDIR  _sources_only)
 FetchContent_MakeAvailable(smallest_tcp)
